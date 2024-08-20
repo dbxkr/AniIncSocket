@@ -4,17 +4,16 @@ import axios from "axios";
 
 const wss = new WebSocketServer({ port: 4000 });
 let players = []; // 현재 연결된 플레이어들을 저장하는 배열
+let gamePlayers = [];
 let readyCount = 0; // 현재 레디 상태인 플레이어 수
 let gameState = "waiting"; // 게임 상태 (대기 중, 진행 중 등)
 let ladder = []; // 게임에서 사용할 사다리 데이터
 let results = []; // 게임 결과를 저장할 배열
 let gameOver = false; // 게임 종료 여부를 나타내는 플래그
 let countdownInterval; // 카운트다운 타이머를 저장할 변수
-
 let countdowns = {};
 let fake = {};
 let dept = [];
-
 // 클라이언트가 서버에 연결될 때 실행되는 함수
 wss.on("connection", (ws) => {
   const clientId = uuidv4(); // 클라이언트 ID 생성
@@ -68,9 +67,6 @@ wss.on("connection", (ws) => {
       case "gameover":
         gameover(parsedMessage);
         break;
-      case "join":
-        handleJoin(ws, clientId, parsedMessage.room_id);
-        break;
       default:
         console.log("Unknown message type:", parsedMessage.type);
     }
@@ -80,49 +76,55 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     players = players.filter((p) => p.ws !== ws); // 연결 끊은 플레이어 제거
     readyCount = players.filter((p) => p.ready).length; // 레디 상태 갱신
-    broadcastPlayers(); // 모든 클라이언트에게 업데이트된 상태 전송
+    // broadcastPlayers(); // 모든 클라이언트에게 업데이트된 상태 전송
   });
 });
 
 // 플레이어 로그인 처리 함수
 function handleLogin(parsedMessage, ws, clientId) {
-  const player = {
-    clientId: parsedMessage.clientId || clientId, // 플레이어 ID 생성 또는 수신된 ID 사용
-    ws, // WebSocket 연결 객체
-    ready: false,
-    nickname: parsedMessage.userNickname || `Player${players.length + 1}`, // 닉네임이 없으면 기본값으로 Player 사용
-    grade: parsedMessage.userGrade,
-    points: parsedMessage.userPoint,
-    score: 0,
-    picture: parsedMessage.userPicture, // 여기서 오타를 수정
-  };
-  players.push(player); // 새로운 플레이어를 players 배열에 추가
-
-  console.log("Player logged in:", player);
-
-  // 최대 플레이어 수를 초과하면 연결 종료
-  // if (players.length > 4) {
-  //   ws.send(JSON.stringify({ type: "roomFull" }));
-  //   ws.close();
-  //   return;
-  // }
-
-  // 초기화 메시지를 클라이언트에 전송
-  ws.send(
-    JSON.stringify({
-      type: "init",
-      clientId: player.clientId,
-      playerNum: players.length,
-    })
+  const existingPlayer = players.find(
+    (p) => p.clientId === (parsedMessage.clientId || clientId)
   );
 
-  // 전체 플레이어 상태를 클라이언트에 브로드캐스트
-  broadcastPlayers();
+  if (!existingPlayer) {
+    const player = {
+      clientId: parsedMessage.clientId || clientId,
+      ws,
+      ready: false,
+      nickname: parsedMessage.userNickname || `Player${players.length + 1}`,
+      grade: parsedMessage.userGrade,
+      points: parsedMessage.userPoint,
+      score: 0,
+      picture: parsedMessage.userPicture,
+      roomId: parsedMessage.roomId,
+    };
+
+    players.push(player); // 새로운 플레이어를 players 배열에 추가
+
+    console.log("Player logged in:", player);
+    // 최대 플레이어 수를 초과하면 연결 종료
+    if (players.length > 4) {
+      ws.send(JSON.stringify({ type: "roomFull" }));
+      ws.close();
+      return;
+    }
+
+    // 초기화 메시지를 클라이언트에 전송
+    ws.send(
+      JSON.stringify({
+        type: "init",
+        clientId: player.clientId,
+        playerNum: players.length,
+      })
+    );
+
+    // 전체 플레이어 상태를 클라이언트에 브로드캐스트
+    broadcastPlayers(parsedMessage.roomId);
+  }
 }
 
 // 플레이어 레디 상태 처리 함수
-// 플레이어 레디 상태 처리 함수
-function handleReadyMessage(message) {
+async function handleReadyMessage(message) {
   if (!message.clientId) {
     console.log("Received undefined clientId. Message ignored:", message);
     return; // clientId가 undefined인 경우 처리를 중단
@@ -137,7 +139,7 @@ function handleReadyMessage(message) {
       }로 설정되었습니다.`
     );
     readyCount = players.filter((p) => p.ready).length;
-    broadcastPlayers();
+    broadcastPlayers(player.roomId);
 
     // 모든 플레이어가 준비 완료되었을 때만 카운트다운 시작
     if (readyCount === players.length && players.length > 1) {
@@ -156,97 +158,18 @@ function handleReadyMessage(message) {
   }
 }
 
-// 사다리 게임에 입장하면 해당 방 정보를 불러옴.
-const rooms = new Map();
-function handleJoin(ws, clientId, roomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, {
-      players: [],
-      gameState: "waiting",
-      ladder: [],
-      results: [],
-      totalParticipants: 0,
-      winner: null,
-      rewards: [],
-    });
-  }
+// 카운트다운 시작 함수
+function startCountdown() {
+  let countdown = 5; // 5초 카운트다운
+  broadcast({ type: "countdown", countdown });
 
-  const room = rooms.get(roomId);
-
-  axios
-    .get(`http://localhost:8080/api/user/game/ladder/participants/${roomId}`)
-    .then((res) => {
-      room.totalParticipants = res.data.length;
-
-      if (room.players.length < room.totalParticipants) {
-        const newPlayer = {
-          clientId,
-          userNum: res.data[room.players.length].users.userNum,
-          ws,
-          nickname: res.data[room.players.length].users.userNickname,
-          grade: res.data[room.players.length].users.userGrade,
-          userPicture: res.data[room.players.length].users.userPicture,
-        };
-
-        room.players.push(newPlayer);
-        broadcastPlayersToRoom(roomId);
-
-        ws.send(
-          JSON.stringify({
-            type: "gameState",
-            state: room.gameState,
-            ladder: room.ladder,
-            players: room.players.map((p) => ({
-              clientId: p.clientId,
-              nickname: p.nickname,
-              userPicture: p.userPicture,
-            })),
-            totalParticipants: room.totalParticipants,
-            currentParticipants: room.players.length,
-          })
-        );
-
-        if (room.players.length === room.totalParticipants) {
-          startCountdown(roomId);
-        }
-      }
-    })
-    .catch((error) => console.log(error));
-}
-
-function broadcastPlayersToRoom(roomId) {
-  const room = rooms.get(roomId);
-  const playerList = room.players.map((p) => ({
-    clientId: p.clientId,
-    nickname: p.nickname,
-    userPicture: p.userPicture,
-  }));
-
-  broadcastToRoom(
-    roomId,
-    JSON.stringify({
-      type: "players",
-      players: playerList,
-      totalParticipants: room.totalParticipants,
-      currentParticipants: room.players.length,
-    })
-  );
-}
-
-// 사다리 실행 전 카운트다운 시작 함수
-function startCountdown(roomId) {
-  const room = rooms.get(roomId);
-  room.gameState = "countdown";
-  let countdown = 5;
-  const countdownInterval = setInterval(() => {
-    broadcastToRoom(
-      roomId,
-      JSON.stringify({ type: "countdown", count: countdown })
-    );
-    countdown--;
-    if (countdown < 0) {
+  countdownInterval = setInterval(() => {
+    countdown -= 1;
+    if (countdown > 0) {
+      broadcast({ type: "countdown", countdown }); // 매초 카운트다운 업데이트
+    } else {
       clearInterval(countdownInterval);
-      startGame(roomId);
+      startGame(); // 카운트다운이 끝나면 게임 시작
     }
   }, 1000);
 }
@@ -264,88 +187,29 @@ function createLadder(numPlayers) {
 }
 
 // 게임 시작 함수
-function startGame(roomId) {
-  const room = rooms.get(roomId);
-  room.gameState = "running";
-  room.ladder = createLadder(room.players.length);
-  room.rewards = createRandomRewards(room.players.length);
-  room.results = []; // 결과 초기화
-  room.winner = null; // 우승자 초기화
-  console.log("Game starting for room:", roomId);
-  console.log("Ladder:", room.ladder);
-  console.log("Rewards:", room.rewards);
-  broadcastToRoom(
-    roomId,
+function startGame() {
+  gameState = "running";
+  ladder = createLadder(players.length); // 사다리 생성
+  broadcast(
     JSON.stringify({
-      type: "startGame",
-      ladder: room.ladder,
-      players: room.players.map((p) => ({
-        clientId: p.clientId,
-        nickname: p.nickname,
-        userPicture: p.userPicture,
-      })),
-      rewards: room.rewards,
+      type: "startGame", // 게임 시작 메시지 전송
+      ladder,
+      players: players.map((p) => p.clientId),
     })
   );
 }
 
-function createRandomRewards(numPlayers) {
-  const rewards = new Array(numPlayers).fill("bomb");
-  const winIndex = Math.floor(Math.random() * numPlayers);
-  rewards[winIndex] = "win";
-  return rewards;
-}
-
 // 게임 종료 후 결과 처리 함수
 function handleFinishPath(message) {
-  for (const [roomId, room] of rooms.entries()) {
-    const playerIndex = room.players.findIndex(
-      (p) => p.clientId === message.clientId
-    );
-    if (playerIndex !== -1) {
-      const result = {
-        clientId: message.clientId,
-        result: message.result,
-        nickname: room.players[playerIndex].nickname,
-      };
-      room.results.push(result);
-      if (room.rewards[message.result] === "win") {
-        room.winner = {
-          clientId: room.players[playerIndex].clientId,
-          nickname: room.players[playerIndex].nickname,
-          userNum: room.players[playerIndex].userNum,
-        };
-      }
-      console.log(
-        `Player ${result.nickname} finished path. Result: ${message.result}`
-      );
-      console.log(`Current results: ${JSON.stringify(room.results)}`);
-      if (room.results.length === room.players.length) {
-        console.log("Game ended. Sending results to all players.");
-        console.log(`Winner: ${JSON.stringify(room.winner)}`);
-        broadcastToRoom(
-          roomId,
-          JSON.stringify({
-            type: "gameEnded",
-            results: room.results,
-            winner: room.winner,
-            rewards: room.rewards,
-          })
-        );
-        room.gameState = "ended";
-      }
-      break;
-    }
+  results.push({ clientId: message.clientId, result: message.result });
+  if (results.length === players.length) {
+    broadcast(JSON.stringify({ type: "gameEnded", results })); // 게임 종료 메시지 전송
+    gameState = "waiting";
+    results = [];
+    players.forEach((p) => (p.ready = false)); // 모든 플레이어의 레디 상태 초기화
+    readyCount = 0;
+    broadcastPlayers(message.roomId); // 플레이어 상태 업데이트 후 브로드캐스트
   }
-}
-
-function broadcastToRoom(roomId, message) {
-  const room = rooms.get(roomId);
-  room.players.forEach((player) => {
-    if (player.ws.readyState === WebSocket.OPEN) {
-      player.ws.send(message);
-    }
-  });
 }
 
 // 게임 중 점수 업데이트 함수 (스페이스바 누를 때 호출됨)
@@ -392,16 +256,19 @@ function handleSpaceBarPress(message) {
 }
 
 // 플레이어 정보 브로드캐스트 함수
-function broadcastPlayers() {
-  const playerList = players.map((p) => ({
-    clientId: p.clientId,
-    nickname: p.nickname,
-    grade: p.grade,
-    points: p.points,
-    ready: p.ready, // 레디 상태 포함
-    score: p.score,
-    picture: p.picture, // 수정된 부분: 올바른 필드명을 사용하여 데이터를 전송
-  }));
+function broadcastPlayers(roomId) {
+  const playerList = players
+    .filter((p) => p.roomId === roomId)
+    .map((p) => ({
+      clientId: p.clientId,
+      nickname: p.nickname,
+      grade: p.grade,
+      points: p.points,
+      ready: p.ready, // 레디 상태 포함
+      score: p.score,
+      picture: p.picture, // 수정된 부분: 올바른 필드명을 사용하여 데이터를 전송
+      roomId: p.roomId,
+    }));
 
   console.log("플레이어 정보 뿌리는 코드임 >>> ", playerList);
 
@@ -410,13 +277,50 @@ function broadcastPlayers() {
 
 // 메시지 브로드캐스트 함수
 function broadcast(message) {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(
-        typeof message === "string" ? message : JSON.stringify(message)
-      );
+  let parsedMessage;
+
+  // 메시지가 문자열이면 JSON 객체로 파싱
+  if (typeof message === "string") {
+    try {
+      parsedMessage = JSON.parse(message);
+    } catch (e) {
+      console.error("Failed to parse message:", e);
+      return;
     }
-  });
+  } else {
+    // 메시지가 이미 객체라면 그대로 사용
+    parsedMessage = message;
+  }
+
+  // message.type 확인
+  if (parsedMessage.type === "startGame") {
+    const clients = Array.from(wss.clients).filter(
+      (client) => client.readyState === WebSocket.OPEN
+    );
+
+    let currentIndex = 0;
+
+    const intervalId = setInterval(() => {
+      if (currentIndex < clients.length) {
+        const client = clients[currentIndex];
+        client.send(
+          typeof message === "string" ? message : JSON.stringify(message)
+        );
+        currentIndex++;
+      } else {
+        clearInterval(intervalId);
+        console.log("All messages have been sent.");
+      }
+    }, 1000); // 1초 간격으로 메시지 전송
+  } else {
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          typeof message === "string" ? message : JSON.stringify(message)
+        );
+      }
+    });
+  }
 }
 
 //게임 관련된 메세지 통합처리
@@ -425,7 +329,7 @@ function gameRoomMessage(message, roomid, type) {
     ...message,
     type: type,
   };
-  players
+  gamePlayers
     .filter((player) => player.roomid === roomid)
     .forEach((player) => {
       // console.log(
@@ -437,7 +341,7 @@ function gameRoomMessage(message, roomid, type) {
 }
 
 function setPlayer(message, ws) {
-  const existingPlayer = players.find(
+  const existingPlayer = gamePlayers.find(
     (player) =>
       player.roomid === message.roomid && player.usernum === message.usernum
   );
@@ -459,7 +363,7 @@ function setPlayer(message, ws) {
       dept: [],
     };
     console.log("player >>> ", player.nickname);
-    players.push(player);
+    gamePlayers.push(player);
   }
 
   // if (message.turn < 12) {
@@ -549,7 +453,7 @@ function news(message) {
 }
 
 function sendNext(message, cont) {
-  const roomPlayers = players.filter(
+  const roomPlayers = gamePlayers.filter(
     (player) => player.roomid === message.roomid
   );
 
@@ -602,7 +506,7 @@ function turn(message) {
 function notifyAndRemoveDept(roomid) {
   dept = dept.filter((entry) => {
     if (entry.roomid === roomid) {
-      const player = players.find(
+      const player = gamePlayers.find(
         (player) => player.roomid === roomid && player.usernum === entry.usernum
       );
       // console.log("빚쟁이>>", player);
