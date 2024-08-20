@@ -1,5 +1,6 @@
 import WebSocket, { WebSocketServer } from "ws";
 import { v4 as uuidv4 } from "uuid";
+import axios from "axios";
 
 const wss = new WebSocketServer({ port: 4000 });
 let players = []; // 현재 연결된 플레이어들을 저장하는 배열
@@ -61,8 +62,14 @@ wss.on("connection", (ws) => {
       case "fakenews":
         fakeNews(parsedMessage);
         break;
+      case "news":
+        news(parsedMessage);
+        break;
       case "gameover":
         gameover(parsedMessage);
+        break;
+      case "join":
+        handleJoin(ws, clientId, parsedMessage.room_id);
         break;
       default:
         console.log("Unknown message type:", parsedMessage.type);
@@ -94,11 +101,11 @@ function handleLogin(parsedMessage, ws, clientId) {
   console.log("Player logged in:", player);
 
   // 최대 플레이어 수를 초과하면 연결 종료
-  if (players.length > 4) {
-    ws.send(JSON.stringify({ type: "roomFull" }));
-    ws.close();
-    return;
-  }
+  // if (players.length > 4) {
+  //   ws.send(JSON.stringify({ type: "roomFull" }));
+  //   ws.close();
+  //   return;
+  // }
 
   // 초기화 메시지를 클라이언트에 전송
   ws.send(
@@ -149,18 +156,97 @@ function handleReadyMessage(message) {
   }
 }
 
-// 카운트다운 시작 함수
-function startCountdown() {
-  let countdown = 5; // 5초 카운트다운
-  broadcast({ type: "countdown", countdown });
+// 사다리 게임에 입장하면 해당 방 정보를 불러옴.
+const rooms = new Map();
+function handleJoin(ws, clientId, roomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, {
+      players: [],
+      gameState: "waiting",
+      ladder: [],
+      results: [],
+      totalParticipants: 0,
+      winner: null,
+      rewards: [],
+    });
+  }
 
-  countdownInterval = setInterval(() => {
-    countdown -= 1;
-    if (countdown > 0) {
-      broadcast({ type: "countdown", countdown }); // 매초 카운트다운 업데이트
-    } else {
+  const room = rooms.get(roomId);
+
+  axios
+    .get(`http://localhost:8080/api/user/game/ladder/participants/${roomId}`)
+    .then((res) => {
+      room.totalParticipants = res.data.length;
+
+      if (room.players.length < room.totalParticipants) {
+        const newPlayer = {
+          clientId,
+          userNum: res.data[room.players.length].users.userNum,
+          ws,
+          nickname: res.data[room.players.length].users.userNickname,
+          grade: res.data[room.players.length].users.userGrade,
+          userPicture: res.data[room.players.length].users.userPicture,
+        };
+
+        room.players.push(newPlayer);
+        broadcastPlayersToRoom(roomId);
+
+        ws.send(
+          JSON.stringify({
+            type: "gameState",
+            state: room.gameState,
+            ladder: room.ladder,
+            players: room.players.map((p) => ({
+              clientId: p.clientId,
+              nickname: p.nickname,
+              userPicture: p.userPicture,
+            })),
+            totalParticipants: room.totalParticipants,
+            currentParticipants: room.players.length,
+          })
+        );
+
+        if (room.players.length === room.totalParticipants) {
+          startCountdown(roomId);
+        }
+      }
+    })
+    .catch((error) => console.log(error));
+}
+
+function broadcastPlayersToRoom(roomId) {
+  const room = rooms.get(roomId);
+  const playerList = room.players.map((p) => ({
+    clientId: p.clientId,
+    nickname: p.nickname,
+    userPicture: p.userPicture,
+  }));
+
+  broadcastToRoom(
+    roomId,
+    JSON.stringify({
+      type: "players",
+      players: playerList,
+      totalParticipants: room.totalParticipants,
+      currentParticipants: room.players.length,
+    })
+  );
+}
+
+// 사다리 실행 전 카운트다운 시작 함수
+function startCountdown(roomId) {
+  const room = rooms.get(roomId);
+  room.gameState = "countdown";
+  let countdown = 5;
+  const countdownInterval = setInterval(() => {
+    broadcastToRoom(
+      roomId,
+      JSON.stringify({ type: "countdown", count: countdown })
+    );
+    countdown--;
+    if (countdown < 0) {
       clearInterval(countdownInterval);
-      startGame(); // 카운트다운이 끝나면 게임 시작
+      startGame(roomId);
     }
   }, 1000);
 }
@@ -178,29 +264,88 @@ function createLadder(numPlayers) {
 }
 
 // 게임 시작 함수
-function startGame() {
-  gameState = "running";
-  ladder = createLadder(players.length); // 사다리 생성
-  broadcast(
+function startGame(roomId) {
+  const room = rooms.get(roomId);
+  room.gameState = "running";
+  room.ladder = createLadder(room.players.length);
+  room.rewards = createRandomRewards(room.players.length);
+  room.results = []; // 결과 초기화
+  room.winner = null; // 우승자 초기화
+  console.log("Game starting for room:", roomId);
+  console.log("Ladder:", room.ladder);
+  console.log("Rewards:", room.rewards);
+  broadcastToRoom(
+    roomId,
     JSON.stringify({
-      type: "startGame", // 게임 시작 메시지 전송
-      ladder,
-      players: players.map((p) => p.clientId),
+      type: "startGame",
+      ladder: room.ladder,
+      players: room.players.map((p) => ({
+        clientId: p.clientId,
+        nickname: p.nickname,
+        userPicture: p.userPicture,
+      })),
+      rewards: room.rewards,
     })
   );
 }
 
+function createRandomRewards(numPlayers) {
+  const rewards = new Array(numPlayers).fill("bomb");
+  const winIndex = Math.floor(Math.random() * numPlayers);
+  rewards[winIndex] = "win";
+  return rewards;
+}
+
 // 게임 종료 후 결과 처리 함수
 function handleFinishPath(message) {
-  results.push({ clientId: message.clientId, result: message.result });
-  if (results.length === players.length) {
-    broadcast(JSON.stringify({ type: "gameEnded", results })); // 게임 종료 메시지 전송
-    gameState = "waiting";
-    results = [];
-    players.forEach((p) => (p.ready = false)); // 모든 플레이어의 레디 상태 초기화
-    readyCount = 0;
-    broadcastPlayers(); // 플레이어 상태 업데이트 후 브로드캐스트
+  for (const [roomId, room] of rooms.entries()) {
+    const playerIndex = room.players.findIndex(
+      (p) => p.clientId === message.clientId
+    );
+    if (playerIndex !== -1) {
+      const result = {
+        clientId: message.clientId,
+        result: message.result,
+        nickname: room.players[playerIndex].nickname,
+      };
+      room.results.push(result);
+      if (room.rewards[message.result] === "win") {
+        room.winner = {
+          clientId: room.players[playerIndex].clientId,
+          nickname: room.players[playerIndex].nickname,
+          userNum: room.players[playerIndex].userNum,
+        };
+      }
+      console.log(
+        `Player ${result.nickname} finished path. Result: ${message.result}`
+      );
+      console.log(`Current results: ${JSON.stringify(room.results)}`);
+      if (room.results.length === room.players.length) {
+        console.log("Game ended. Sending results to all players.");
+        console.log(`Winner: ${JSON.stringify(room.winner)}`);
+        broadcastToRoom(
+          roomId,
+          JSON.stringify({
+            type: "gameEnded",
+            results: room.results,
+            winner: room.winner,
+            rewards: room.rewards,
+          })
+        );
+        room.gameState = "ended";
+      }
+      break;
+    }
   }
+}
+
+function broadcastToRoom(roomId, message) {
+  const room = rooms.get(roomId);
+  room.players.forEach((player) => {
+    if (player.ws.readyState === WebSocket.OPEN) {
+      player.ws.send(message);
+    }
+  });
 }
 
 // 게임 중 점수 업데이트 함수 (스페이스바 누를 때 호출됨)
@@ -361,15 +506,47 @@ function fakeNews(message) {
     type: "game",
     content: message.content,
   };
-  fake[message.roomid].push({
+  const roomId = message.roomid;
+  if (!fake[roomId]) {
+    fake[roomId] = [];
+  }
+
+  fake[roomId].push({
     turn: message.turn,
     stock: message.stockId,
     describe: message.describe,
   });
+  // console.log(fake[roomId]);
   gameRoomMessage(newMessage, message.roomid, "game");
 }
 
-function news(message) {}
+function news(message) {
+  const roomId = message.roomid;
+  const stockId = message.stock;
+  const turn = message.turn;
+  let describe = "no";
+
+  // console.log("fake", fake);
+  if (fake[roomId]) {
+    const fakeStocks = fake[roomId].filter(
+      (item) => item.stock === stockId && item.turn === turn
+    );
+
+    // console.log("fakeStocks", fakeStocks);
+
+    if (fakeStocks.length > 0) {
+      const randomIndex = Math.floor(Math.random() * fakeStocks.length);
+      describe = fakeStocks[randomIndex].describe;
+    }
+  }
+
+  const newMessage = {
+    type: "news",
+    describe: describe,
+  };
+
+  gameRoomMessage(newMessage, roomId, "news");
+}
 
 function sendNext(message, cont) {
   const roomPlayers = players.filter(
