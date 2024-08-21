@@ -485,7 +485,7 @@ function turn(message) {
   let remainingSeconds = 0;
   countdowns[roomid] = setInterval(() => {
     if (remainingSeconds < 180) {
-      if (remainingSeconds === 10) {
+      if (remainingSeconds === 6) {
         notifyAndRemoveDept(roomid);
       }
       gameRoomMessage(
